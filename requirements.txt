@@ -1,0 +1,20 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch 
+torchvision 
+torchaudio
+numpy 
+pandas 
+jupyter 
+matplotlib 
+seaborn 
+scikit-learn 
+pyarrow 
+polars 
+xgboost
+kaggle
+hyperopt
+category_encoders
+tqdm
+mlflow
+skore
+skrub
