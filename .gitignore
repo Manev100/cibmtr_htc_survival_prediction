@@ -1,3 +1,7 @@
+data
+mlruns
+.venv
+
 # vscode files
 *.code-workspace
 
