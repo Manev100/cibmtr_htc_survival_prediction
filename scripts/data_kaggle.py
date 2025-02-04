@@ -13,7 +13,7 @@ from sklearn import metrics
 from category_encoders import CountEncoder
 from category_encoders.hashing import HashingEncoder
 
-from target import transform_target_aft, transform_target_cox, transform_target_km_filter, transform_target_1, transform_target_2
+from target import transform_target_aft, transform_target_cox, transform_target_km_filter, transform_target_1, transform_target_2, transform_target_na_filter
 
 def create_preprocessor (config: dict = {"numeric_type": None, "low_cardinality_type": None, "high_cardinality_type": None},
                          features: dict = {"passthrough_features": [], "numeric_features":[], "low_cardinality_features": [], "high_cardinality_features": []},
@@ -124,7 +124,13 @@ def preprocess(train_data: pl.DataFrame, test_data: pl.DataFrame, target, data_c
 
 # config: dict = {"numeric_type": numeric_type, "low_cardinality_type": low_cardinality_type, "high_cardinality_type": high_cardinality_type},
 def prepare_data(train_ds: pl.DataFrame, data_dict: pl.DataFrame, test_ds: pl.DataFrame | None = None, target_col="target_cox", data_config: dict = {"numeric_type": None, "low_cardinality_type": None, "high_cardinality_type": None}, seed=42):
-    train_ds = train_ds.pipe(transform_target_aft).pipe(transform_target_cox).pipe(transform_target_km_filter).pipe(transform_target_1).pipe(transform_target_2)
+    train_ds = (train_ds
+                .pipe(transform_target_aft)
+                .pipe(transform_target_cox)
+                .pipe(transform_target_km_filter)
+                .pipe(transform_target_na_filter)
+                .pipe(transform_target_1)
+                .pipe(transform_target_2))
     
     features = data_dict.select(pl.col("variable")).filter(pl.col("variable").is_in(["efs", "efs_time"]).not_()).to_series().to_list()
     

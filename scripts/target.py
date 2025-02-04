@@ -1,7 +1,8 @@
 import polars as pl
 import numpy as np
-from lifelines import KaplanMeierFitter
+from lifelines import KaplanMeierFitter, NelsonAalenFitter
 from lifelines.utils import concordance_index
+import os
 
 # Transform aft target for xgboost
 # Note that it is not yet possible to set the ranged label using the scikit-learn interface (e.g. xgboost.XGBRegressor). For now, you should use xgboost.train with xgboost.DMatrix
@@ -42,6 +43,25 @@ def transform_target_km_filter(data):
     return data.with_columns(pl.Series(t).alias("target_km"))
 
 
+# Transform target with Nelson Aalen Fitter
+# eval_metric="mae",
+# objective='reg:logistic',
+# (pd.Series(oof_xgb).rank(pct=True))*0.5+pd.Series(oof_cat).rank(pct=True)*0.5
+def transform_target_na_filter(data):
+    def transform_survival_probability(df, time_col='efs_time', event_col='efs'):
+        kmf = NelsonAalenFitter()
+        kmf.fit(durations=df[time_col], event_observed=df[event_col])
+        y = kmf.cumulative_hazard_at_times(df[time_col]).values
+        
+        # Adjust for censoring
+        # censored_mask = df[event_col] == 0
+        # y[censored_mask] = y[censored_mask] * 1.2  # Increase survival prob for censored
+        return y
+
+    t = transform_survival_probability(data.to_pandas(), time_col='efs_time', event_col='efs')
+    return data.with_columns(pl.Series(t).alias("target_na"))
+
+
 # Transform target #1
 # XGBRegressor
 # eval_metric="mae",
@@ -77,3 +97,15 @@ def transform_target_2(data):
     train.y -= train.y.mean()
     train.y *= -1.0
     return data.with_columns(pl.Series(train.y).alias("target2"))
+
+
+if __name__ == "__main__":
+    COMP_DATA_BASE = os.path.join( "data", "comp")
+    TRAIN_PATH = os.path.join(COMP_DATA_BASE, "train.csv")
+    data = transform_target_na_filter(pl.read_csv(TRAIN_PATH))
+    print(data)
+    
+    data = transform_target_km_filter(pl.read_csv(TRAIN_PATH))
+    print(data)
+        
+    
