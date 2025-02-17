@@ -95,7 +95,7 @@ def preprocess(train, val, test, normalization='quantile', target="target_cox", 
     ft = FeatureUnion(
         [('other', ct),
         ('passthrough', ct_pt)],
-        # verbose_feature_names_out=False
+        verbose_feature_names_out=False
     )
     ft.set_output(transform="polars")
 
@@ -392,6 +392,159 @@ def train(model_dict, data, verbose=False):
         print('\n\nResult:')
         print(best)
     return best
+
+
+def inference(model_dict, data, n_epochs=1_000_000_000, verbose=False):
+    model = model_dict["model"]
+    optimizer = model_dict["optimizer"]
+    evaluation_mode = model_dict["eval_mode"]
+    device = model_dict["device"]
+    grad_scaler = model_dict["grad_scaler"]
+    amp_enabled = model_dict["amp_enabled"]
+    amp_dtype = model_dict["amp_dtype"]
+    target_transformer = model_dict["target_transformer"]
+    target = model_dict["target"]
+    
+    
+    @torch.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype)  # type: ignore[code]
+    def apply_model(part: str, idx: Tensor) -> Tensor:
+        return (
+            model(
+                data[part]['x_cont'][idx],
+                data[part]['x_cat'][idx] if 'x_cat' in data[part] else None,
+            )
+            .squeeze(-1)  # Remove the last dimension for regression tasks.
+            .float()
+        )
+
+    task_type = "regression"
+    base_loss_fn = F.mse_loss if task_type == 'regression' else F.cross_entropy
+
+
+    def loss_fn(y_pred: Tensor, y_true: Tensor) -> Tensor:
+        # TabM produces k predictions per object. Each of them must be trained separately.
+        # (regression)     y_pred.shape == (batch_size, k)
+        # (classification) y_pred.shape == (batch_size, k, n_classes)
+        k = y_pred.shape[-1 if task_type == 'regression' else -2]
+        return base_loss_fn(y_pred.flatten(0, 1), y_true.repeat_interleave(k))
+
+
+    @evaluation_mode()
+    def predict(part: str):
+        model.eval()
+
+        # When using torch.compile, you may need to reduce the evaluation batch size.
+        eval_batch_size = 8096
+        y_pred: np.ndarray = (
+            torch.cat(
+                [
+                    apply_model(part, idx)
+                    for idx in torch.arange(len(data[part]['y']), device=device).split(
+                        eval_batch_size
+                    )
+                ]
+            )
+            .cpu()
+            .numpy()
+        )
+        if task_type == 'regression':
+            # Transform the predictions back to the original label space.
+            assert target_transformer is not None
+            y_pred = target_transformer.inverse_transform(y_pred) 
+
+        # Compute the mean of the k predictions.
+        if task_type != 'regression':
+            # For classification, the mean must be computed in the probabily space.
+            y_pred = softmax(y_pred, axis=-1)
+        y_pred = y_pred.mean(1)
+
+        return y_pred  # The higher -- the better.
+
+    @evaluation_mode()
+    def evaluate(part: str) -> float:
+        model.eval()
+
+        # When using torch.compile, you may need to reduce the evaluation batch size.
+        eval_batch_size = 8096
+        y_pred: np.ndarray = (
+            torch.cat(
+                [
+                    apply_model(part, idx)
+                    for idx in torch.arange(len(data[part]['y']), device=device).split(
+                        eval_batch_size
+                    )
+                ]
+            )
+            .cpu()
+            .numpy()
+        )
+        if task_type == 'regression':
+            # Transform the predictions back to the original label space.
+            assert target_transformer is not None
+            y_pred = target_transformer.inverse_transform(y_pred) 
+
+        # Compute the mean of the k predictions.
+        if task_type != 'regression':
+            # For classification, the mean must be computed in the probabily space.
+            y_pred = softmax(y_pred, axis=-1)
+        y_pred = y_pred.mean(1)
+
+        y_true = data[part]['y'].cpu().numpy()
+        
+        if task_type == 'regression':
+            y_true = data[part]["metric"].copy()
+            y_pred_df = data[part]["metric"][["ID"]].copy()
+            if target in ["target_na", "target1"]:
+                y_pred_df["prediction"] = -y_pred
+            else:
+                y_pred_df["prediction"] = y_pred
+            m = score(y_true.copy(), y_pred_df.copy(), "ID")
+        
+        sc = (
+            # -(mean_squared_error(y_true, y_pred) ** 0.5)
+            m
+            if task_type == 'regression'
+            else accuracy_score(y_true, y_pred.argmax(1))
+        )
+        return float(sc)  # The higher -- the better.
+
+  
+    batch_size = 256
+    epoch_size = math.ceil(len(data["train"]["x_cont"]) / batch_size)
+
+    if verbose:
+        print('-' * 88 + '\n')
+    for epoch in range(n_epochs):
+        for batch_idx in tqdm(
+            torch.randperm(len(data['train']['y']), device=device).split(batch_size),
+            desc=f'Epoch {epoch}',
+            total=epoch_size,
+            disable=not verbose
+        ):
+            model.train()
+            optimizer.zero_grad()
+            loss = loss_fn(apply_model('train', batch_idx), data["train"]["y"][batch_idx])
+            if grad_scaler is None:
+                loss.backward()
+                optimizer.step()
+            else:
+                grad_scaler.scale(loss).backward()  # type: ignore
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+
+    for part in data.keys():
+        y_pred = predict(part)
+        
+        y_pred_df = data[part]["metric"].to_pandas()[["ID"]].copy()
+        if target in ["target_na", "target1"]:
+            y_pred_df["prediction"] = -y_pred
+        else:
+            y_pred_df["prediction"] = y_pred
+            
+        data[part]["prediction"] = y_pred_df
+        
+    
+    return data
 
 if __name__ == "__main__":
     from target import *

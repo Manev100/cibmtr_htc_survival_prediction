@@ -48,10 +48,12 @@ class RegressionLabelStats(NamedTuple):
     mean: float
     std: float
 
-def preprocess(train, val, test, normalization='quantile', target="target_cox", norm_target: bool = False):
+def preprocess(train, val, test, normalization='quantile', target="target_cox", norm_target: bool = False, seed=42):
     assert normalization in ['quantile', 'standard', 'passthrough'], f"Unknown normalization type {normalization}, must be 'quantile', 'standard'or 'passthrough'"
     assert train is not None, "train cannot be none"
     assert target in ['target_cox', 'target_km', 'target_na', 'target1', 'target2'], f"Unknown target {target}"
+    
+    np.random.seed(seed + 1)
     
     passthrough_cols = ['ID', 'efs', 'efs_time', 'race_group'] + ['target_cox', 'target_km', 'target_na', 'target1', 'target2']
     cat_features = list(train
@@ -146,7 +148,9 @@ def preprocess(train, val, test, normalization='quantile', target="target_cox", 
 
 
 
-def prepare_model(data_prep, config):
+def prepare_model(data_prep, config, seed=42):
+    torch.manual_seed(seed + 2)
+    
     # Device
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -249,7 +253,7 @@ def prepare_model(data_prep, config):
 
 
 
-def train(model_dict, data, verbose=False):
+def train(model_dict, data, n_epochs=1_000_000_000, patience=16, verbose=False):
     model = model_dict["model"]
     optimizer = model_dict["optimizer"]
     evaluation_mode = model_dict["eval_mode"]
@@ -283,6 +287,37 @@ def train(model_dict, data, verbose=False):
         k = y_pred.shape[-1 if task_type == 'regression' else -2]
         return base_loss_fn(y_pred.flatten(0, 1), y_true.repeat_interleave(k))
 
+
+    @evaluation_mode()
+    def predict(part: str):
+        model.eval()
+
+        # When using torch.compile, you may need to reduce the evaluation batch size.
+        eval_batch_size = 8096
+        y_pred: np.ndarray = (
+            torch.cat(
+                [
+                    apply_model(part, idx)
+                    for idx in torch.arange(len(data[part]['y']), device=device).split(
+                        eval_batch_size
+                    )
+                ]
+            )
+            .cpu()
+            .numpy()
+        )
+        if task_type == 'regression':
+            # Transform the predictions back to the original label space.
+            assert target_transformer is not None
+            y_pred = target_transformer.inverse_transform(y_pred) 
+
+        # Compute the mean of the k predictions.
+        if task_type != 'regression':
+            # For classification, the mean must be computed in the probabily space.
+            y_pred = softmax(y_pred, axis=-1)
+        y_pred = y_pred.mean(1)
+
+        return y_pred  # The higher -- the better.
 
     @evaluation_mode()
     def evaluate(part: str) -> float:
@@ -332,26 +367,10 @@ def train(model_dict, data, verbose=False):
         )
         return float(sc)  # The higher -- the better.
 
-    if verbose:
-        print(f'Test score before training: {evaluate("test"):.4f}')
-    
-    # For demonstration purposes (fast training and bad performance),
-    # one can set smaller values:
-    # n_epochs = 20
-    # patience = 2
-    n_epochs = 1_000_000_000
-    patience = 16
-
+  
     batch_size = 256
     epoch_size = math.ceil(len(data["train"]["x_cont"]) / batch_size)
-    best = {
-        'val': -math.inf,
-        'test': -math.inf,
-        'epoch': -1,
-    }
-    # Early stopping: the training stops when
-    # there are more than `patience` consequtive bad updates.
-    patience = 16
+
     remaining_patience = patience
 
     if verbose:
@@ -374,28 +393,8 @@ def train(model_dict, data, verbose=False):
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
 
-        val_score = evaluate('val')
-        test_score = evaluate('test')
-        if verbose:
-            print(f'(val) {val_score:.4f} (test) {test_score:.4f}')
 
-        if val_score > best['val']:
-            if verbose:
-                print('🌸 New best epoch! 🌸')
-            best = {'val': val_score, 'test': test_score, 'epoch': epoch}
-            remaining_patience = patience
-        else:
-            remaining_patience -= 1
-
-        if remaining_patience < 0:
-            break
-        
-        if verbose:
-            print()
-    if verbose:
-        print('\n\nResult:')
-        print(best)
-    return best
+    return predict("test")
 
 if __name__ == "__main__":
     from target import *
@@ -448,11 +447,11 @@ if __name__ == "__main__":
     }
     
     model_dict, data = prepare_model(data_prep, config=CONFIG | space)
-    results = train(model_dict, data)
+    preds = train(model_dict, data, n_epochs=30)
     
     model = model_dict["model"]
     target_transformer = model_dict["target_transformer"]
     
-    print(f"Run result: val {results['val']} - test {results['test']} - epochs {results['epoch']}" )
-    
+    print(preds.shape)
+    print(preds)
         
